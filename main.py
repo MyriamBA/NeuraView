@@ -1,15 +1,17 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.responses import JSONResponse
+from datetime import datetime, timezone
 import sqlite3
 import os
-from datetime import datetime, timezone
 import uuid
-import pandas as pd  # For content validation in CSV files
+import pandas as pd  
+import numpy as np
+from sklearn.preprocessing import LabelEncoder
 from fastapi.middleware.cors import CORSMiddleware
+from io import StringIO
 
 
 app = FastAPI()
-
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,7 +51,8 @@ def save_metadata(file_id, filename, storage_path, file_type):
     """Save file metadata to SQLite database."""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
-    upload_time = datetime.now(timezone.utc)
+    # Convert datetime to a string to avoid datetime adapter issues
+    upload_time = datetime.now().isoformat()
     cursor.execute("INSERT INTO file_metadata (id, filename, storage_path, upload_time, file_type) VALUES (?, ?, ?, ?, ?)",
                    (file_id, filename, storage_path, upload_time, file_type))
     conn.commit()
@@ -79,6 +82,64 @@ def validate_file(file: UploadFile):
     # Reset the file pointer after reading
     file.file.seek(0)
 
+# Data cleaning and processing
+def clean_and_process_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Clean and process the uploaded data.
+
+    Steps include:
+    - Handling missing values
+    - Removing duplicates
+    - Standardizing formats
+    - Encoding categorical variables
+    - Scaling numerical features (if needed)
+
+    Args:
+        df (pd.DataFrame): The dataframe containing the raw uploaded data.
+
+    Returns:
+        pd.DataFrame: The cleaned and processed dataframe.
+    """
+
+    # Step 1: Handle missing values
+    # Example: Fill numeric columns with the median, categorical with the mode
+    for column in df.columns:
+        if df[column].dtype == 'object':  # Categorical column
+            df[column].fillna(df[column].mode()[0], inplace=True)  # Fill with mode
+        else:  # Numerical column
+            df[column].fillna(df[column].median(), inplace=True)  # Fill with median
+
+    # Step 2: Remove duplicate rows
+    df.drop_duplicates(inplace=True)
+
+    # Step 3: Standardize date formats (if applicable)
+    for column in df.columns:
+        if 'date' in column.lower() and df[column].dtype == 'object':
+            df[column] = pd.to_datetime(df[column], errors='coerce')  # Convert to datetime
+
+    # Step 4: Handle outliers (example: using IQR to filter out outliers)
+    for column in df.select_dtypes(include=[np.number]).columns:
+        Q1 = df[column].quantile(0.25)
+        Q3 = df[column].quantile(0.75)
+        IQR = Q3 - Q1
+        lower_bound = Q1 - 1.5 * IQR
+        upper_bound = Q3 + 1.5 * IQR
+        df = df[(df[column] >= lower_bound) & (df[column] <= upper_bound)]
+
+    # Step 5: Encode categorical variables
+    for column in df.select_dtypes(include=['object']).columns:
+        encoder = LabelEncoder()
+        df[column] = encoder.fit_transform(df[column])
+
+    # Step 6: Optional - Scaling numerical features (if needed)
+    # from sklearn.preprocessing import StandardScaler
+    # scaler = StandardScaler()
+    # df[df.select_dtypes(include=[np.number]).columns] = scaler.fit_transform(df[df.select_dtypes(include=[np.number]).columns])
+
+    return df
+
+
+
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
     try:
@@ -97,13 +158,36 @@ async def upload_file(file: UploadFile = File(...)):
         # Save metadata to SQLite
         save_metadata(file_id, file.filename, file_path, file.content_type)
 
-        return JSONResponse(content={"message": f"File '{file.filename}' uploaded and metadata stored successfully."})
-    
+          # Attempt to read the file into a DataFrame, specifying a delimiter if necessary
+        try:
+            df = pd.read_csv(StringIO(content.decode("utf-8")))
+        except pd.errors.ParserError:
+            raise HTTPException(status_code=400, detail="Failed to parse file. Please check the file format.")
+        except pd.errors.EmptyDataError:
+            raise HTTPException(status_code=400, detail="The uploaded file appears to be empty or improperly formatted.")
+
+        # Check if DataFrame is empty
+        if df.empty:
+            raise HTTPException(status_code=400, detail="The uploaded file contains no data.")
+         # Clean and process the data
+
+        cleaned_df = clean_and_process_data(df)
+
+        # Save cleaned file
+        file_id = str(uuid.uuid4())
+        storage_path = os.path.join(UPLOAD_DIRECTORY, f"{file_id}_{file.filename}")
+        cleaned_df.to_csv(storage_path, index=False)
+
+        # Save metadata with string-formatted datetime
+        save_metadata(file_id, file.filename, storage_path, file.content_type)
+
+        return JSONResponse(content={"message": f"File '{file.filename}' uploaded and cleaned successfully.", "storage_path": storage_path})
+
     except HTTPException as e:
         return JSONResponse(content={"message": str(e.detail)}, status_code=e.status_code)
     except Exception as e:
         print(e)
-        return JSONResponse(content={"message": "There was an error uploading the file."}, status_code=500)
+        return JSONResponse(content={"message": "There was an error uploading or processing the file."}, status_code=500)
 
 @app.get("/files")
 async def list_files():
