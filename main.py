@@ -138,7 +138,32 @@ def clean_and_process_data(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def extract_date_features(df, date_column):
+    df[date_column] = pd.to_datetime(df[date_column])  # Ensure date format
+    df["year"] = df[date_column].dt.year
+    df["month"] = df[date_column].dt.month
+    df["day"] = df[date_column].dt.day
+    df["weekday"] = df[date_column].dt.weekday
+    return df
 
+def aggregate_by_category(df, groupby_column, numeric_column):
+    aggregated_df = df.groupby(groupby_column)[numeric_column].agg(['mean', 'sum', 'count']).reset_index()
+    aggregated_df.columns = [groupby_column, f"{numeric_column}_mean", f"{numeric_column}_sum", f"{numeric_column}_count"]
+    return df.merge(aggregated_df, on=groupby_column, how="left")
+
+def encode_categorical(df, categorical_columns):
+    label_encoders = {}
+    for column in categorical_columns:
+        le = LabelEncoder()
+        df[column] = le.fit_transform(df[column])
+        label_encoders[column] = le  # Store for inverse transformation if needed
+    return df, label_encoders
+
+def create_interaction_features(df, columns):
+    for i, col1 in enumerate(columns):
+        for col2 in columns[i+1:]:
+            df[f"{col1}_x_{col2}"] = df[col1] * df[col2]
+    return df
 
 @app.post("/upload")
 async def upload_file(file: UploadFile = File(...)):
@@ -188,6 +213,28 @@ async def upload_file(file: UploadFile = File(...)):
     except Exception as e:
         print(e)
         return JSONResponse(content={"message": "There was an error uploading or processing the file."}, status_code=500)
+
+@app.post("/feature-engineering")
+async def feature_engineering():
+    # Load the cleaned data
+    data_path = "../uploaded_files"
+    data = pd.read_csv(data_path)
+    
+    # Apply feature engineering steps
+    if "transaction_date" in data.columns:
+        data = extract_date_features(data, "transaction_date")
+    if "customer_id" in data.columns and "transaction_amount" in data.columns:
+        data = aggregate_by_category(data, "customer_id", "transaction_amount")
+    categorical_columns = ["product_category", "region"]  # Update with actual columns
+    data, encoders = encode_categorical(data, categorical_columns)
+    numeric_columns = ["transaction_amount", "customer_age"]  # Update as needed
+    data = create_interaction_features(data, numeric_columns)
+
+    # Save the engineered data
+    engineered_data_path = "path/to/engineered_data.csv"
+    data.to_csv(engineered_data_path, index=False)
+
+    return {"message": "Feature extraction and engineering completed.", "path": engineered_data_path}
 
 @app.get("/files")
 async def list_files():
